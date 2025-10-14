@@ -232,6 +232,26 @@ class AdamW:
 
 tests.test_adamw(AdamW)
 # %%
+def rosenbrocks_banana_func(x: Tensor, y: Tensor, a=1, b=100) -> Tensor:
+    """
+    This function has a global minimum at `(a, a)` so in this case `(1, 1)`. It's characterized by a
+    long, narrow, parabolic valley (parameterized by `y = x**2`). Various gradient descent methods
+    have trouble navigating this valley because they often oscillate unstably (gradients from the
+    `b`-term dwarf the gradients from the `a`-term).
+
+    See more on this function: https://en.wikipedia.org/wiki/Rosenbrock_function.
+    """
+    return (a - x) ** 2 + b * (y - x**2) ** 2 + 1
+
+
+plot_fn(
+    rosenbrocks_banana_func,
+    x_range=(-2.5, 2.5),
+    y_range=(-2, 4),
+    z_range=(0, 100),
+    min_points=[(1, 1)],
+)
+# %%
 def opt_fn(
     fn: Callable,
     xy: Tensor,
@@ -305,24 +325,585 @@ def neg_trimodal_func(x, y):
 
 
 plot_fn(neg_trimodal_func, x_range=(-2, 2), y_range=(-2, 2), min_points=means)
+
 # %%
-def rosenbrocks_banana_func(x: Tensor, y: Tensor, a=1, b=100) -> Tensor:
-    """
-    This function has a global minimum at `(a, a)` so in this case `(1, 1)`. It's characterized by a
-    long, narrow, parabolic valley (parameterized by `y = x**2`). Various gradient descent methods
-    have trouble navigating this valley because they often oscillate unstably (gradients from the
-    `b`-term dwarf the gradients from the `a`-term).
+def get_cifar() -> tuple[datasets.CIFAR10, datasets.CIFAR10]:
+    """Returns CIFAR-10 train and test sets."""
+    cifar_trainset = datasets.CIFAR10(
+        exercises_dir / "data", train=True, download=True, transform=IMAGENET_TRANSFORM
+    )
+    cifar_testset = datasets.CIFAR10(
+        exercises_dir / "data", train=False, download=True, transform=IMAGENET_TRANSFORM
+    )
+    return cifar_trainset, cifar_testset
 
-    See more on this function: https://en.wikipedia.org/wiki/Rosenbrock_function.
-    """
-    return (a - x) ** 2 + b * (y - x**2) ** 2 + 1
 
+IMAGE_SIZE = 224
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
-plot_fn(
-    rosenbrocks_banana_func,
-    x_range=(-2.5, 2.5),
-    y_range=(-2, 4),
-    z_range=(0, 100),
-    min_points=[(1, 1)],
+IMAGENET_TRANSFORM = transforms.Compose(
+    [
+        transforms.ToTensor(),
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ]
 )
+
+
+cifar_trainset, cifar_testset = get_cifar()
+
+imshow(
+    cifar_trainset.data[:15],
+    facet_col=0,
+    facet_col_wrap=5,
+    facet_labels=[cifar_trainset.classes[i] for i in cifar_trainset.targets[:15]],
+    title="CIFAR-10 images",
+    height=600,
+    width=1000,
+)
+# %%
+@dataclass
+class ResNetFinetuningArgs:
+    n_classes: int = 10
+    batch_size: int = 128
+    epochs: int = 3
+    learning_rate: float = 1e-3
+    weight_decay: float = 0.0
+
+
+class ResNetFinetuner:
+    def __init__(self, args: ResNetFinetuningArgs):
+        self.args = args
+
+    def pre_training_setup(self):
+        self.model = get_resnet_for_feature_extraction(self.args.n_classes).to(device)
+        self.optimizer = AdamW(
+            self.model.out_layers[-1].parameters(),
+            lr=self.args.learning_rate,
+            weight_decay=self.args.weight_decay,
+        )
+        self.trainset, self.testset = get_cifar()
+        self.train_loader = DataLoader(self.trainset, batch_size=self.args.batch_size, shuffle=True)
+        self.test_loader = DataLoader(self.testset, batch_size=self.args.batch_size, shuffle=False)
+        self.logged_variables = {"loss": [], "accuracy": []}
+        self.examples_seen = 0
+
+    def training_step(
+        self,
+        imgs: Float[Tensor, "batch channels height width"],
+        labels: Int[Tensor, "batch"],
+    ) -> Float[Tensor, ""]:
+        """Perform a gradient update step on a single batch of data."""
+        imgs, labels = imgs.to(device), labels.to(device)
+
+        logits = self.model(imgs)
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        self.examples_seen += imgs.shape[0]
+        self.logged_variables["loss"].append(loss.item())
+        return loss
+
+    @t.inference_mode()
+    def evaluate(self) -> float:
+        """Evaluate the model on the test set and return the accuracy."""
+        self.model.eval()
+        total_correct, total_samples = 0, 0
+
+        for imgs, labels in tqdm(self.test_loader, desc="Evaluating"):
+            imgs, labels = imgs.to(device), labels.to(device)
+            logits = self.model(imgs)
+            total_correct += (logits.argmax(dim=1) == labels).sum().item()
+            total_samples += len(imgs)
+
+        accuracy = total_correct / total_samples
+        self.logged_variables["accuracy"].append(accuracy)
+        return accuracy
+
+    def train(self) -> dict[str, list[float]]:
+        self.pre_training_setup()
+
+        accuracy = self.evaluate()
+
+        for epoch in range(self.args.epochs):
+            self.model.train()
+
+            pbar = tqdm(self.train_loader, desc="Training")
+            for imgs, labels in pbar:
+                loss = self.training_step(imgs, labels)
+                pbar.set_postfix(loss=f"{loss:.3f}", ex_seen=f"{self.examples_seen:06}")
+
+            accuracy = self.evaluate()
+            pbar.set_postfix(
+                loss=f"{loss:.3f}", accuracy=f"{accuracy:.2f}", ex_seen=f"{self.examples_seen:06}"
+            )
+
+        return self.logged_variables
+# %%
+args = ResNetFinetuningArgs()
+trainer = ResNetFinetuner(args)
+logged_variables = trainer.train()
+# %%
+line(
+    y=[logged_variables["loss"][: 391 * 3 + 1], logged_variables["accuracy"][:4]],
+    x_max=len(logged_variables["loss"][: 391 * 3 + 1] * args.batch_size),
+    yaxis2_range=[0, 1],
+    use_secondary_yaxis=True,
+    labels={"x": "Examples seen", "y1": "Cross entropy loss", "y2": "Test Accuracy"},
+    title="Feature extraction with ResNet34",
+    width=800,
+)
+# %%
+def test_resnet_on_random_input(model: ResNet34, n_inputs: int = 3, seed: int | None = 42):
+    if seed is not None:
+        np.random.seed(seed)
+    indices = np.random.choice(len(cifar_trainset), n_inputs).tolist()
+    classes = [cifar_trainset.classes[cifar_trainset.targets[i]] for i in indices]
+    imgs = cifar_trainset.data[indices]
+    device = next(model.parameters()).device
+    with t.inference_mode():
+        x = t.stack(list(map(IMAGENET_TRANSFORM, imgs)))
+        logits: Tensor = model(x.to(device))
+    probs = logits.softmax(-1)
+    if probs.ndim == 1:
+        probs = probs.unsqueeze(0)
+    for img, label, prob in zip(imgs, classes, probs):
+        display(HTML(f"<h2>Classification probabilities (true class = {label})</h2>"))
+        imshow(img, width=200, height=200, margin=0, xaxis_visible=False, yaxis_visible=False)
+        bar(
+            prob,
+            x=cifar_trainset.classes,
+            width=600,
+            height=400,
+            text_auto=".2f",
+            labels={"x": "Class", "y": "Prob"},
+        )
+
+
+test_resnet_on_random_input(trainer.model)
+# %%
+@dataclass
+class WandbResNetFinetuningArgs(ResNetFinetuningArgs):
+    """Contains new params for use in wandb.init, as well as all the ResNetFinetuningArgs params."""
+
+    wandb_project: str | None = "day3-resnet"
+    wandb_name: str | None = None
+
+
+class WandbResNetFinetuner(ResNetFinetuner):
+    args: WandbResNetFinetuningArgs  # adding this line helps with typechecker!
+    examples_seen: int = 0  # tracking examples seen (used as step for wandb)
+
+    def pre_training_setup(self):
+        """Initializes the wandb run using `wandb.init` and `wandb.watch`."""
+        super().pre_training_setup()
+        wandb.init(project='day3-resnet')
+        wandb.watch(self.model)
+        self.model = get_resnet_for_feature_extraction(self.args.n_classes).to(device)
+        self.optimizer = AdamW(
+            self.model.out_layers[-1].parameters(),
+            lr=self.args.learning_rate,
+            weight_decay=self.args.weight_decay,
+        )
+        self.trainset, self.testset = get_cifar()
+        self.train_loader = DataLoader(self.trainset, batch_size=self.args.batch_size, shuffle=True)
+        self.test_loader = DataLoader(self.testset, batch_size=self.args.batch_size, shuffle=False)
+        self.logged_variables = {"loss": [], "accuracy": []}
+        self.examples_seen = 0
+
+    def training_step(
+        self,
+        imgs: Float[Tensor, "batch channels height width"],
+        labels: Int[Tensor, "batch"],
+    ) -> Float[Tensor, ""]:
+        """Equivalent to ResNetFinetuner.training_step, but logging the loss to wandb."""
+        imgs, labels = imgs.to(device), labels.to(device)
+
+        logits = self.model(imgs)
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        self.examples_seen += imgs.shape[0]
+        wandb.log({ "loss" : loss.item(), "step":self.examples_seen})
+        return loss
+
+    @t.inference_mode()
+    def evaluate(self) -> float:
+        """Equivalent to ResNetFinetuner.evaluate, but logging the accuracy to wandb."""
+        self.model.eval()
+        total_correct, total_samples = 0, 0
+
+        for imgs, labels in tqdm(self.test_loader, desc="Evaluating"):
+            imgs, labels = imgs.to(device), labels.to(device)
+            logits = self.model(imgs)
+            total_correct += (logits.argmax(dim=1) == labels).sum().item()
+            total_samples += len(imgs)
+
+        accuracy = total_correct / total_samples
+        wandb.log({'accuracy': accuracy, "step":self.examples_seen})
+        return accuracy
+
+    def train(self) -> None:
+        """Equivalent to ResNetFinetuner.train, but with wandb integration."""
+        self.pre_training_setup()
+
+        accuracy = self.evaluate()
+
+        for epoch in range(self.args.epochs):
+            self.model.train()
+
+            pbar = tqdm(self.train_loader, desc="Training")
+            for imgs, labels in pbar:
+                loss = self.training_step(imgs, labels)
+                pbar.set_postfix(loss=f"{loss:.3f}", ex_seen=f"{self.examples_seen:06}")
+
+            accuracy = self.evaluate()
+            pbar.set_postfix(
+                loss=f"{loss:.3f}", accuracy=f"{accuracy:.2f}", ex_seen=f"{self.examples_seen:06}"
+            )
+        
+        wandb.finish()
+
+        return self.logged_variables
+
+
+args = WandbResNetFinetuningArgs()
+trainer = WandbResNetFinetuner(args)
+trainer.train()
+# %%
+# YOUR CODE HERE - fill `sweep_config` so it has the requested behaviour
+sweep_config = dict(
+    method = 'random',
+    metric = dict(
+        name = 'accuracy',
+        goal = 'maximize',
+    ),
+    parameters = dict(
+        lr = dict(min=1e-4, max=1e-1, distribution='log_uniform_values'),
+        batch_size = dict(values =[32, 64, 128, 256]),
+        weight_decay_bool = dict(values=[True, False]),
+        weight_decay = dict(min = 1e-4, max = 1e-2, distribution='log_uniform_values'),
+    ),
+)
+
+
+def update_args(
+    args: WandbResNetFinetuningArgs, sampled_parameters: dict
+) -> WandbResNetFinetuningArgs:
+    """
+    Returns a new args object with modified values. The dictionary `sampled_parameters` will have
+    the same keys as your `sweep_config["parameters"]` dict, and values equal to the sampled values
+    of those hyperparameters.
+    """
+    assert set(sampled_parameters.keys()) == set(sweep_config["parameters"].keys())
+
+    args.learning_rate = sampled_parameters['lr']
+    args.batch_size = sampled_parameters['batch_size']
+
+    weight_decay_bool = sampled_parameters['weight_decay_bool']
+    if weight_decay_bool:
+        args.weight_decay = sampled_parameters['weight_decay']
+    else:
+        args.weight_decay = 0
+    return args
+
+
+tests.test_sweep_config(sweep_config)
+tests.test_update_args(update_args, sweep_config)
+# %%
+def train():
+    # Define args & initialize wandb
+    args = WandbResNetFinetuningArgs()
+    wandb.init(project=args.wandb_project, name=args.wandb_name, reinit=False)
+
+    # After initializing wandb, we can update args using `wandb.config`
+    args = update_args(args, dict(wandb.config))
+
+    # Train the model with these new hyperparameters (the second `wandb.init` call will be ignored)
+    trainer = WandbResNetFinetuner(args)
+    trainer.train()
+
+
+sweep_id = wandb.sweep(sweep=sweep_config, project="day3-resnet-sweep")
+wandb.agent(sweep_id=sweep_id, function=train, count=3)
+wandb.finish()
+# %%
+
+WORLD_SIZE = t.cuda.device_count()
+
+os.environ["MASTER_ADDR"] = "localhost"
+os.environ["MASTER_PORT"] = "12345"
+
+def send_receive_nccl(rank, world_size):
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    device = t.device(f"cuda:{rank}")
+
+    if rank == 0:
+        # Create a tensor, send it to rank 1
+        sending_tensor = t.tensor([rank], device=device)
+        print(f"{rank=}, {device=}, sending {sending_tensor=}")
+        dist.send(sending_tensor, dst=1)  # Send tensor to CPU before sending
+    elif rank == 1:
+        # Receive tensor from rank 0 (it needs to be on the CPU before receiving)
+        received_tensor = t.tensor([rank], device=device)
+        print(f"{rank=}, {device=}, creating {received_tensor=}")
+        dist.recv(
+            received_tensor, src=0
+        )  # this line overwrites the tensor's data with our `sending_tensor`
+        print(f"{rank=}, {device=}, received {received_tensor=}")
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    world_size = 2  # simulate 2 processes
+    mp.spawn(
+        send_receive_nccl,
+        args=(world_size,),
+        nprocs=world_size,
+        join=True,
+
+    )
+# %%
+def broadcast(tensor: Tensor, rank: int, world_size: int, src: int = 0):
+    """
+    Broadcast averaged gradients from rank 0 to all other ranks.
+    """
+    if rank == src:
+        for other_rank in range(world_size):
+            if other_rank != src:
+                dist.send(tensor, dst=other_rank)
+    else:
+        received_tensor = t.zeros_like(tensor)
+        dist.recv(received_tensor, src=src)
+        tensor.copy_(received_tensor)
+# %%
+def reduce(tensor, rank, world_size, dst=0, op: Literal["sum", "mean"] = "sum"):
+    """
+    Reduces gradients to rank `dst`, so this process contains the sum or mean of all tensors across
+    processes.
+    """
+    if rank != dst:
+        dist.send(tensor, dst=dst)
+    else:
+        for other_rank in range(world_size):
+            if other_rank != dst:
+                received_tensor = t.zeros_like(tensor)
+                dist.recv(received_tensor, src=other_rank)
+                tensor += received_tensor
+    if op == "mean":
+        tensor /= world_size
+
+
+def all_reduce(tensor, rank, world_size, op: Literal["sum", "mean"] = "sum"):
+    """
+    Allreduce the tensor across all ranks, using 0 as the initial gathering rank.
+    """
+    reduce(tensor, rank, world_size, dst=0, op=op)
+    broadcast(tensor, rank, world_size, src=0)
+# %%
+class SimpleModel(t.nn.Module):
+    def __init__(self):
+        super(SimpleModel, self).__init__()
+        self.param = t.nn.Parameter(t.tensor([2.0]))
+
+    def forward(self, x: Tensor):
+        return x - self.param
+
+
+def run_simple_model(rank, world_size):
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    device = t.device(f"cuda:{rank}")
+    model = SimpleModel().to(device)  # Move the model to the device corresponding to this process
+    optimizer = t.optim.SGD(model.parameters(), lr=0.1)
+
+    input = t.tensor([rank], dtype=t.float32, device=device)
+    output = model(input)
+    loss = output.pow(2).sum()
+    loss.backward()  # Each rank has separate gradients at this point
+
+    print(f"Rank {rank}, before all_reduce, grads: {model.param.grad=}")
+    all_reduce(model.param.grad, rank, world_size)  # Synchronize gradients
+    print(
+        f"Rank {rank}, after all_reduce, synced grads (summed over processes): {model.param.grad=}"
+    )
+
+    optimizer.step()  # Step with the optimizer (this will update all models the same way)
+    print(f"Rank {rank}, new param: {model.param.data}")
+
+    dist.destroy_process_group()
+
+
+# if __name__ == "__main__":
+#     world_size = 2
+#     mp.spawn(
+#         run_simple_model,
+#         args=(world_size,),
+#         nprocs=world_size,
+#         join=True,
+#     )
+# %%
+
+def get_untrained_resnet(n_classes: int) -> ResNet34:
+    """
+    Gets untrained resnet using code from part2_cnns.solutions (you can replace this with your
+    implementation).
+    """
+    resnet = ResNet34()
+    resnet.out_layers[-1] = Linear(resnet.out_features_per_group[-1], n_classes)
+    return resnet
+
+
+@dataclass
+class DistResNetTrainingArgs(WandbResNetFinetuningArgs):
+    world_size: int = 1
+    wandb_project: str | None = "day3-resnet-dist-training"
+
+
+class DistResNetTrainer:
+    args: DistResNetTrainingArgs
+
+    def __init__(self, args: DistResNetTrainingArgs, rank: int):
+        self.args = args
+        self.rank = rank
+        self.device = t.device(f"cuda:{rank}")
+
+    def pre_training_setup(self):
+        self.model = get_untrained_resnet(self.args.n_classes).to(self.device)
+        if self.args.world_size > 1:
+            for param in self.model.parameters():
+                broadcast(param.data, self.rank, self.args.world_size, src=0)
+        
+        self.optimizer = t.optim.AdamW(
+            self.model.parameters(), lr=self.args.learning_rate, weight_decay=self.args.weight_decay
+        )
+
+        self.trainset, self.testset = get_cifar()
+        self.train_sampler = self.test_sampler = None
+        if self.args.world_size > 1:
+            self.train_sampler = DistributedSampler(self.trainset, num_replicas=self.args.world_size, rank=self.rank)
+            self.test_sampler = DistributedSampler(self.testset, num_replicas=self.args.world_size, rank=self.rank)            
+        
+        dataloader_shared_kwargs = dict(batch_size=self.args.batch_size, num_workers=2, pin_memory=True)
+        self.train_loader = DataLoader(self.trainset, sampler=self.train_sampler, **dataloader_shared_kwargs)
+        self.test_loader = DataLoader(self.testset, sampler=self.test_sampler, **dataloader_shared_kwargs)
+        
+        self.examples_seen = 0
+
+        if self.rank == 0:
+            wandb.init(
+                project=self.args.wandb_project,
+                name=self.args.wandb_name,
+                config=self.args,
+            )
+
+    def training_step(self, imgs: Tensor, labels: Tensor) -> Tensor:
+        t0 = time.time()
+
+        imgs, labels = imgs.to(self.device), labels.to(self.device)
+        logits = self.model(imgs)
+        t1 = time.time()
+
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        t2 = time.time()
+
+        if self.args.world_size > 1:
+            for param in self.model.parameters():
+                all_reduce(param.grad, self.rank, self.args.world_size, op="mean")
+        t3 = time.time()
+
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.examples_seen += imgs.shape[0] * self.args.world_size
+
+        if self.rank == 0:
+            wandb.log(
+                {
+                    "loss": loss.item(),
+                    "fwd_time": (t1 - t0),
+                    "bwd_time": (t2 - t1),
+                    "dist_time": (t3 - t2),
+                },
+                step=self.examples_seen,
+            )
+        return loss
+    
+    @t.inference_mode()
+    def evaluate(self) -> float:
+        self.model.eval()
+        total_correct, total_samples = 0, 0
+
+        for imgs, labels in tqdm(self.test_loader, desc="Evaluating", disable=self.rank != 0):
+            imgs, labels = imgs.to(self.device), labels.to(self.device)
+            logits = self.model(imgs)
+            total_correct += (logits.argmax(dim=1) == labels).sum().item()
+            total_samples += len(imgs)
+
+        tensor = t.tensor([total_correct, total_samples], device=self.device)
+        all_reduce(tensor, self.rank, self.args.world_size, op="sum")
+        total_correct, total_samples = tensor.tolist()
+
+        accuracy = total_correct / total_samples
+        if self.rank == 0:
+            wandb.log({"accuracy": accuracy}, step=self.examples_seen)
+        return accuracy
+    
+    def train(self):
+        self.pre_training_setup()
+
+        accuracy = self.evaluate() 
+
+        for epoch in range(self.args.epochs):
+            t0 = time.time()
+
+            if self.args.world_size > 1:
+                self.train_sampler.set_epoch(epoch)
+                self.test_sampler.set_epoch(epoch)
+
+            self.model.train()
+
+            pbar = tqdm(self.train_loader, desc="Training", disable=self.rank != 0)
+            for imgs, labels in pbar:
+                loss = self.training_step(imgs, labels)
+                pbar.set_postfix(loss=f"{loss:.3f}", ex_seen=f"{self.examples_seen=:06}")
+
+            accuracy = self.evaluate()
+
+            if self.rank == 0:
+                wandb.log({"epoch_duration": time.time() - t0}, step=self.examples_seen)
+                pbar.set_postfix(
+                    loss=f"{loss:.3f}",
+                    accuracy=f"{accuracy:.3f}",
+                    ex_seen=f"{self.examples_seen=:06}",
+                )
+
+        if self.rank == 0:
+            wandb.finish()
+            t.save(self.model.state_dict(), f"resnet_{self.rank}.pth")
+
+
+def dist_train_resnet_from_scratch(rank, world_size):
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    args = DistResNetTrainingArgs(world_size=world_size)
+    trainer = DistResNetTrainer(args, rank)
+    trainer.train()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    world_size = t.cuda.device_count()
+    mp.spawn(
+        dist_train_resnet_from_scratch,
+        args=(world_size,),
+        nprocs=world_size,
+        join=True,
+    )
 # %%
