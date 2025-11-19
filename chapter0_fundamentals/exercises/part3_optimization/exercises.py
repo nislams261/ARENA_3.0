@@ -907,3 +907,35 @@ if __name__ == "__main__":
         join=True,
     )
 # %%
+
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+def run(rank: int, world_size: int):
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    device = t.device(f"cuda:{rank}")
+    model = DDP(SimpleModel().to(device), device_ids=[rank])  # Wrap the model with DDP
+    optimizer = t.optim.SGD(model.parameters(), lr=0.1)
+
+    input = t.tensor([rank], dtype=t.float32, device=device)
+    output = model(input)
+    loss = output.pow(2).sum()
+    loss.backward()  # DDP handles gradient synchronization
+
+    optimizer.step()
+    print(f"Rank {rank}, new param: {model.module.param.data}")
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    world_size = 2
+    mp.spawn(
+        run,
+        args=(world_size,),
+        nprocs=world_size,
+        join=True,
+    )
+
+#%%
